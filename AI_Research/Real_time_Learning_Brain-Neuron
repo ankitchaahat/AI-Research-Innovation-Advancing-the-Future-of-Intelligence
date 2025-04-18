@@ -1,0 +1,174 @@
+import numpy as np
+import pyaudio
+from python_speech_features import mfcc
+import pyttsx3
+import time
+from collections import deque
+
+# ===== MIC CONFIGURATION =====
+RATE = 16000
+CHUNK = RATE
+MIC_INDEX = None  # Use default system microphone
+
+# ===== MLIF NEURON =====
+class MLIFNeuron:
+    def __init__(self, threshold=1.0, V_rest=0.0, tau_m=20.0, Rm=1.0, k=5.0, lambda_=0.2, dt=1.0):
+        self.v = V_rest
+        self.v_prev = V_rest
+        self.V_rest = V_rest
+        self.threshold = threshold
+        self.tau_m = tau_m
+        self.Rm = Rm
+        self.k = k
+        self.lambda_ = lambda_
+        self.dt = dt
+        self.energy = 0
+        self.total_spikes = 0
+
+    def step(self, input_current):
+        eta = np.random.normal(0, 0.5)  # small noise
+        dv = (self.dt / self.tau_m) * (-(self.v - self.V_rest) + self.k * self.Rm * input_current)
+        dv += self.lambda_ * (self.v - self.v_prev) + eta
+        self.v_prev = self.v
+        self.v += dv
+        self.energy += abs(dv)
+
+        if self.v >= self.threshold:
+            self.v = self.V_rest
+            self.total_spikes += 1
+            return 1
+        return 0
+
+# ===== SPIKING NEURAL NETWORK (SNN) BRAIN =====
+class SNNBrain:
+    def __init__(self, num_inputs=13, commands=["jump", "fly", "run", "stop"]):
+        self.num_inputs = num_inputs
+        self.commands = commands
+        self.num_outputs = len(commands)
+        self.synapses = np.random.uniform(0, 0.5, (self.num_outputs, num_inputs))
+        self.memory = deque(maxlen=5)
+
+    def forward(self, input_spikes):
+        output_spikes = []
+        for i in range(self.num_outputs):
+            potential = np.dot(self.synapses[i], input_spikes)
+            output_spikes.append(1 if potential >= 0.5 else 0)
+        return output_spikes
+
+    def learn(self, input_spikes, label_index):
+        self.synapses[label_index] += 0.3 * np.array(input_spikes)
+        self.synapses = np.clip(self.synapses, 0, 1)
+
+    def predict_command(self, output_spikes):
+        for i, spike in enumerate(output_spikes):
+            if spike == 1:
+                self.memory.append(self.commands[i])
+                return self.commands[i]
+        return None
+
+    def decide_next_action(self):
+        if not self.memory:
+            return "I don't remember anything."
+        freq = {cmd: self.memory.count(cmd) for cmd in self.commands}
+        most_common = max(freq, key=freq.get)
+        return f"Based on memory, I think you want to {most_common}."
+
+# ===== TEXT TO SPEECH =====
+def speak(text):
+    engine = pyttsx3.init()
+    engine.say(text)
+    engine.runAndWait()
+
+# ===== RECORD AUDIO =====
+def record_audio():
+    p = pyaudio.PyAudio()
+    stream = p.open(format=pyaudio.paInt16,
+                    channels=1,
+                    rate=RATE,
+                    input=True,
+                    input_device_index=MIC_INDEX,
+                    frames_per_buffer=CHUNK)
+    print("🎤 Speak in 1 sec...")
+    time.sleep(0.5)
+    print("🎙️ Recording...")
+    audio_data = stream.read(CHUNK)
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+    signal = np.frombuffer(audio_data, dtype=np.int16)
+    return signal
+
+# ===== MFCC EXTRACTION =====
+def extract_mfcc(signal, rate=RATE):
+    mfcc_feat = mfcc(signal, rate, numcep=13)
+    return np.mean(mfcc_feat, axis=0)
+
+# ===== SPIKE ENCODING (reusing same neuron instances) =====
+persistent_neurons = [MLIFNeuron() for _ in range(13)]
+
+def encode_spikes(mfcc_features):
+    return [neuron.step(val / 2.0) for neuron, val in zip(persistent_neurons, mfcc_features)]
+
+
+# ===== MAIN PROGRAM =====
+if __name__ == "__main__":
+    brain = SNNBrain()
+    decisions = 0
+    start_time = time.time()
+
+    print("\n TRAINING MODE (type 'q' to quit)")
+    while True:
+        user_cmd = input("Type command label (jump/fly/run/stop) or 'q' to quit: ").strip().lower()
+        if user_cmd == "q":
+            break
+        if user_cmd not in brain.commands:
+            print("Invalid command. Try again.")
+            continue
+
+        signal = record_audio()
+        mfcc_features = extract_mfcc(signal)
+        spikes = encode_spikes(mfcc_features)
+        print("⚡ Training Spikes:", spikes)
+
+        label_index = brain.commands.index(user_cmd)
+        brain.learn(spikes, label_index)
+        print(" Learned pattern for:", user_cmd)
+
+    print("\n TESTING MODE (type 'q' to quit)")
+    while True:
+        q = input("Press Enter to speak or 'q' to quit: ")
+        if q.strip().lower() == 'q':
+            break
+
+        signal = record_audio()
+        mfcc_features = extract_mfcc(signal)
+        spikes = encode_spikes(mfcc_features)
+        print("⚡ Testing Spikes:", spikes)
+
+        output_spikes = brain.forward(spikes)
+        potentials = [round(np.dot(syn, spikes), 2) for syn in brain.synapses]
+        print("🔩 Output Potentials:", potentials)
+
+        command = brain.predict_command(output_spikes)
+        decisions += 1
+
+        if command:
+            response = f"{command.title()}ing now!"
+            print(" AI says:", response)
+            speak(response)
+        else:
+            decision = brain.decide_next_action()
+            print(" AI says: I didn't understand.")
+            speak("I didn't understand.")
+            print(" AI guesses:", decision)
+            speak(decision)
+
+        total_energy = sum(n.energy for n in persistent_neurons)
+        total_spikes = sum(n.total_spikes for n in persistent_neurons)
+        elapsed_time = time.time() - start_time
+        dps = decisions / elapsed_time if elapsed_time > 0 else 0
+
+        print(f" Energy per spike: {total_energy / total_spikes:.2f}" if total_spikes else "⚠️ No spikes yet.")
+        print(f" Total energy: {total_energy:.2f}")
+        print(f" Total spikes: {total_spikes}")
+        print(f" Decisions/sec: {dps:.2f}")
